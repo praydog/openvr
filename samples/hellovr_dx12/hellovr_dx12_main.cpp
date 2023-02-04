@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string>
 #include <cstdlib>
+#include <deque>
 
 #include <openvr.h>
 
@@ -815,8 +816,80 @@ void CMainApplication::RenderFrame()
 		RenderStereoTargets();
 		RenderCompanionWindow();
 
-		m_pCommandList->Close();
+		struct TextureToPose {
+			ComPtr<ID3D12Resource> texture;
+			vr::HmdMatrix34_t pose;
+		};
 
+		static std::deque<TextureToPose> oldLeftEyeTextures{};
+		static std::deque<TextureToPose> oldRightEyeTextures{};
+
+		ComPtr<ID3D12Resource> copiedLeftEyeTexture{};
+		ComPtr<ID3D12Resource> copiedRightEyeTexture{};
+
+		// Copy the left eye texture into a new resource
+		{
+			auto desc = m_leftEyeDesc.m_pTexture->GetDesc();
+
+			m_pDevice->CreateCommittedResource(
+				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+				D3D12_HEAP_FLAG_NONE,
+				&desc,
+				D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+				nullptr,
+				IID_PPV_ARGS(&copiedLeftEyeTexture));
+
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( m_leftEyeDesc.m_pTexture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE ) );
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( copiedLeftEyeTexture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST ) );
+
+			m_pCommandList->CopyResource(copiedLeftEyeTexture.Get(), m_leftEyeDesc.m_pTexture.Get());
+
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( m_leftEyeDesc.m_pTexture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE ) );
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( copiedLeftEyeTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE ) );
+		}
+
+		// Copy the right eye texture into a new resource
+		{
+			auto desc = m_rightEyeDesc.m_pTexture->GetDesc();
+
+			m_pDevice->CreateCommittedResource(
+				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+				D3D12_HEAP_FLAG_NONE,
+				&desc,
+				D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+				nullptr,
+				IID_PPV_ARGS(&copiedRightEyeTexture));
+
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( m_rightEyeDesc.m_pTexture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE ) );
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( copiedRightEyeTexture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST ) );
+
+			m_pCommandList->CopyResource(copiedRightEyeTexture.Get(), m_rightEyeDesc.m_pTexture.Get());
+
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( m_rightEyeDesc.m_pTexture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE ) );
+			m_pCommandList->ResourceBarrier( 1, &CD3DX12_RESOURCE_BARRIER::Transition( copiedRightEyeTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE ) );
+		}
+
+		vr::TrackedDevicePose_t hmdPose{};
+		vr::TrackedDevicePose_t gamePose{};
+		vr::VRCompositor()->GetLastPoseForTrackedDeviceIndex(vr::k_unTrackedDeviceIndex_Hmd, &hmdPose, &gamePose);
+
+		// Push the new resources onto the front of the queue
+		// Pop the back if size is greater than 20
+		oldLeftEyeTextures.push_front(TextureToPose{ copiedLeftEyeTexture, hmdPose.mDeviceToAbsoluteTracking });
+		oldRightEyeTextures.push_front(TextureToPose{ copiedRightEyeTexture, hmdPose.mDeviceToAbsoluteTracking });
+
+		if (oldLeftEyeTextures.size() > 20)
+		{
+			oldLeftEyeTextures.pop_back();
+		}
+
+		if (oldRightEyeTextures.size() > 20)
+		{
+			oldRightEyeTextures.pop_back();
+		}
+
+		m_pCommandList->Close();
+		
 		// Execute the command list.
 		ID3D12CommandList* ppCommandLists[] = { m_pCommandList.Get() };
 		m_pCommandQueue->ExecuteCommandLists( _countof( ppCommandLists ), ppCommandLists );
@@ -827,13 +900,28 @@ void CMainApplication::RenderFrame()
 		bounds.vMin = 0.0f;
 		bounds.vMax = 1.0f;
 
-		vr::D3D12TextureData_t d3d12LeftEyeTexture = { m_leftEyeDesc.m_pTexture.Get(), m_pCommandQueue.Get(), 0 };
-		vr::Texture_t leftEyeTexture = { ( void * ) &d3d12LeftEyeTexture, vr::TextureType_DirectX12, vr::ColorSpace_Gamma };
-		vr::VRCompositor()->Submit( vr::Eye_Left, &leftEyeTexture, &bounds, vr::Submit_Default );
+		auto& oldestLeftEyeTexture = oldLeftEyeTextures.back();
+		auto& oldestRightEyeTexture = oldRightEyeTextures.back();
 
-		vr::D3D12TextureData_t d3d12RightEyeTexture = { m_rightEyeDesc.m_pTexture.Get(), m_pCommandQueue.Get(), 0 };
-		vr::Texture_t rightEyeTexture = { ( void * ) &d3d12RightEyeTexture, vr::TextureType_DirectX12, vr::ColorSpace_Gamma };
-		vr::VRCompositor()->Submit( vr::Eye_Right, &rightEyeTexture, &bounds, vr::Submit_Default );
+		vr::D3D12TextureData_t d3d12LeftEyeTexture = { oldestLeftEyeTexture.texture.Get(), m_pCommandQueue.Get(), 0 };
+
+		vr::VRTextureWithPose_t leftEyeTexture;
+		leftEyeTexture.handle = (void*)&d3d12LeftEyeTexture;
+		leftEyeTexture.eType = vr::TextureType_DirectX12;
+		leftEyeTexture.eColorSpace = vr::ColorSpace_Gamma;
+		leftEyeTexture.mDeviceToAbsoluteTracking = oldestLeftEyeTexture.pose;
+
+		vr::VRCompositor()->Submit( vr::Eye_Left, &leftEyeTexture, &bounds, vr::Submit_TextureWithPose);
+
+		vr::D3D12TextureData_t d3d12RightEyeTexture = { oldestRightEyeTexture.texture.Get(), m_pCommandQueue.Get(), 0 };
+
+		vr::VRTextureWithPose_t rightEyeTexture;
+		rightEyeTexture.handle = (void*)&d3d12RightEyeTexture;
+		rightEyeTexture.eType = vr::TextureType_DirectX12;
+		rightEyeTexture.eColorSpace = vr::ColorSpace_Gamma;
+		rightEyeTexture.mDeviceToAbsoluteTracking = oldestRightEyeTexture.pose;
+
+		vr::VRCompositor()->Submit( vr::Eye_Right, &rightEyeTexture, &bounds, vr::Submit_TextureWithPose );
 	}
 
 	// Present
